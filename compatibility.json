@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "project": "niri-tilejoin",
+  "release": "unreleased",
+  "niri_revision": "feb3e43f1475e0865bb89cbd1e898b34d1d2ccf6",
+  "smithay_revision": "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef",
+  "config_schema": 1,
+  "support_tiers": {
+    "validated_native": ["LG UltraFine 5K dual-SST TILE panel"],
+    "validated_generalized": ["two-output EVDI/DisplayLink portrait wall"],
+    "experimental_generalized": ["other rectangular two-to-four-output groups"]
+  }
+}

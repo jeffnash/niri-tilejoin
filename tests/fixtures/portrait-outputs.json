@@ -1,0 +1,38 @@
+{
+  "DVI-I-1": {
+    "make": "Unknown",
+    "model": "Unknown",
+    "serial": null,
+    "physical_size": null,
+    "current_mode": 0,
+    "modes": [
+      {"width": 3840, "height": 2160, "refresh_rate": 60000}
+    ],
+    "logical": {
+      "x": 8068,
+      "y": 0,
+      "width": 1728,
+      "height": 3072,
+      "scale": 1.25,
+      "transform": "270"
+    }
+  },
+  "DVI-I-2": {
+    "make": "LG Electronics",
+    "model": "LG ULTRAFINE",
+    "serial": "0x01010101",
+    "physical_size": [600, 340],
+    "current_mode": 0,
+    "modes": [
+      {"width": 3840, "height": 2160, "refresh_rate": 59997}
+    ],
+    "logical": {
+      "x": 6340,
+      "y": 0,
+      "width": 1728,
+      "height": 3072,
+      "scale": 1.25,
+      "transform": "90"
+    }
+  }
+}
