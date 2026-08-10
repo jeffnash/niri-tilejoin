@@ -1,0 +1,52 @@
+name: Publish compatible source release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*\+niri-*'
+
+jobs:
+  source-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Validate compatibility tag and repository
+        run: |
+          revision=$(awk -F= '$1 == "revision" { print $2 }' upstream.lock)
+          case "${GITHUB_REF_NAME}" in
+            *+niri-${revision:0:8}) ;;
+            *) echo "tag must end in +niri-${revision:0:8}" >&2; exit 1 ;;
+          esac
+          python -m pip install --disable-pip-version-check ruff==0.15.5 mypy==1.17.1
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+          ./scripts/check-repository.sh
+          mypy
+
+      - name: Build deterministic source archive and checksum
+        run: |
+          mkdir dist
+          git archive --format=tar --prefix="niri-tilejoin-${GITHUB_REF_NAME}/" HEAD \
+            | gzip -n >"dist/niri-tilejoin-${GITHUB_REF_NAME}.tar.gz"
+          sha256sum "dist/niri-tilejoin-${GITHUB_REF_NAME}.tar.gz" >dist/SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

@@ -1,0 +1,97 @@
+name: Validate patchset
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  repository-quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out patchset
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Install repository checks
+        run: |
+          python -m pip install --disable-pip-version-check ruff==0.15.5 mypy==1.17.1
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
+      - name: Check helpers, types, licenses, and shell
+        run: |
+          ./scripts/check-repository.sh
+          mypy
+
+  nix-interface:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out patchset
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+
+      - name: Evaluate locked packages
+        run: |
+          nix flake metadata --no-update-lock-file
+          nix eval --raw .#packages.${{ matrix.system }}.niri-tilejoin.drvPath >/dev/null
+          nix build --no-link .#packages.${{ matrix.system }}.niri-tilejoin
+
+  apply-and-test:
+    needs: repository-quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out patchset
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Check out pinned upstream
+        run: |
+          repository=$(awk -F= '$1 == "repository" { print $2 }' upstream.lock)
+          revision=$(awk -F= '$1 == "revision" { print $2 }' upstream.lock)
+          git clone --filter=blob:none --no-checkout "$repository" upstream
+          git -C upstream checkout --detach "$revision"
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libdbus-1-dev libdrm-dev libegl1-mesa-dev libgbm-dev libinput-dev \
+            libdisplay-info-dev libpipewire-0.3-dev libpango1.0-dev libseat-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev pkg-config
+
+      - name: Install dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Apply patchset
+        run: |
+          # This checkout is disposable and exists only for CI, so explicit in-place
+          # integration is correct here; user-provided source trees remain isolated.
+          ./scripts/apply-patches.sh --in-place upstream
+          cmp integration/niri/Cargo.lock upstream/Cargo.lock
+
+      - name: Check and test
+        working-directory: upstream
+        run: |
+          cargo check --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test --lib
+          cargo test -p niri-config
+          cargo test -p niri-tiled
+          cargo audit
