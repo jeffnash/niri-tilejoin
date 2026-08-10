@@ -1,0 +1,43 @@
+name: Hardware validation report
+description: Report a tested display-group topology or lifecycle failure
+title: "[hardware] "
+labels: [hardware]
+body:
+  - type: markdown
+    attributes:
+      value: Do not publish unredacted serial numbers, credentials, or private configuration.
+  - type: input
+    id: tilejoin
+    attributes:
+      label: niri-tilejoin revision
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Kernel, GPU, and DRM driver
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: DRM nodes, connectors, modes, transforms, scale, and refresh policy
+    validations:
+      required: true
+  - type: checkboxes
+    id: lifecycle
+    attributes:
+      label: Scenarios exercised
+      options:
+        - label: Cold start and hotplug
+        - label: DPMS off/on
+        - label: VT switch or suspend/resume
+        - label: Individual member unplug/replug
+        - label: Scale/config reload
+        - label: Seam-crossing damage and direct/composited transitions
+  - type: textarea
+    id: result
+    attributes:
+      label: Result, logs, and observed KMS state
+    validations:
+      required: true
