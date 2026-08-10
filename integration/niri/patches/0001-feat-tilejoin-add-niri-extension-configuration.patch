@@ -1,0 +1,1173 @@
+From e1eafcf1fad6a9b55b174bd900c1fd7053194930 Mon Sep 17 00:00:00 2001
+From: niri-tilejoin <niri-tilejoin@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 12:44:39 -0700
+Subject: [PATCH 1/4] feat(tilejoin): add niri extension configuration
+
+---
+ Cargo.lock                |  17 +
+ Cargo.toml                |   2 +
+ niri-config/Cargo.toml    |   1 +
+ niri-config/src/debug.rs  |   4 +
+ niri-config/src/lib.rs    |  93 ++++-
+ niri-config/src/output.rs | 831 +++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 944 insertions(+), 4 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2512ea50..e261a538 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2261,6 +2261,7 @@ dependencies = [
+  "log",
+  "niri-config",
+  "niri-ipc",
++ "niri-tiled",
+  "ordered-float",
+  "pango",
+  "pangocairo",
+@@ -2303,6 +2304,7 @@ dependencies = [
+  "pretty_assertions",
+  "regex",
+  "smithay",
++ "tempfile",
+  "tracing",
+  "tracy-client",
+ ]
+@@ -2317,6 +2319,21 @@ dependencies = [
+  "serde_json",
+ ]
+ 
++[[package]]
++name = "niri-tiled"
++version = "26.4.0"
++dependencies = [
++ "anyhow",
++ "bytemuck",
++ "drm-ffi",
++ "niri-config",
++ "niri-ipc",
++ "proptest",
++ "smithay",
++ "tracing",
++ "tracy-client",
++]
++
+ [[package]]
+ name = "niri-visual-tests"
+ version = "26.4.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index f27f81d5..b5e838d6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,5 +1,6 @@
+ [workspace]
+ members = [
++    "niri-tiled",
+     "niri-config",
+     "niri-ipc",
+     "niri-visual-tests",
+@@ -77,6 +78,7 @@ libdisplay-info = "0.3.0"
+ log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
+ niri-config = { version = "26.4.0", path = "niri-config" }
+ niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
++niri-tiled = { version = "26.4.0", path = "niri-tiled" }
+ ordered-float = "5.3.0"
+ pango = { version = "0.21.5", features = ["v1_44"] }
+ pangocairo = "0.21.5"
+diff --git a/niri-config/Cargo.toml b/niri-config/Cargo.toml
+index 1cc0373d..aa230ceb 100644
+--- a/niri-config/Cargo.toml
++++ b/niri-config/Cargo.toml
+@@ -22,3 +22,4 @@ tracy-client.workspace = true
+ insta.workspace = true
+ pretty_assertions = "1.4.1"
+ diff = "0.1.13"
++tempfile = "3.27.0"
+diff --git a/niri-config/src/debug.rs b/niri-config/src/debug.rs
+index 7841ce0e..925e612f 100644
+--- a/niri-config/src/debug.rs
++++ b/niri-config/src/debug.rs
+@@ -24,6 +24,7 @@ pub struct Debug {
+     pub honor_xdg_activation_with_invalid_serial: bool,
+     pub deactivate_unfocused_windows: bool,
+     pub skip_cursor_only_updates_during_vrr: bool,
++    pub tiled_groups: bool,
+ }
+ 
+ #[derive(knuffel::Decode, Debug, Default, PartialEq)]
+@@ -68,6 +69,8 @@ pub struct DebugPart {
+     pub deactivate_unfocused_windows: Option<Flag>,
+     #[knuffel(child)]
+     pub skip_cursor_only_updates_during_vrr: Option<Flag>,
++    #[knuffel(child)]
++    pub tiled_groups: Option<Flag>,
+ }
+ 
+ impl MergeWith<DebugPart> for Debug {
+@@ -91,6 +94,7 @@ impl MergeWith<DebugPart> for Debug {
+             honor_xdg_activation_with_invalid_serial,
+             deactivate_unfocused_windows,
+             skip_cursor_only_updates_during_vrr,
++            tiled_groups,
+         );
+ 
+         merge_clone_opt!((self, part), preview_render, render_drm_device);
+diff --git a/niri-config/src/lib.rs b/niri-config/src/lib.rs
+index 77f07967..a1f57dfb 100644
+--- a/niri-config/src/lib.rs
++++ b/niri-config/src/lib.rs
+@@ -54,7 +54,10 @@ pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocu
+ pub use crate::layer_rule::LayerRule;
+ pub use crate::layout::*;
+ pub use crate::misc::*;
+-pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
++pub use crate::output::{
++    DisplayGroup, DisplayGroupMember, GroupRefreshSync, GroupRenderPolicy, Output,
++    OutputConfigBinding, OutputName, Outputs, Position, TiledGroup, Vrr,
++};
+ use crate::recent_windows::RecentWindowsPart;
+ pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+ pub use crate::utils::FloatOrInt;
+@@ -126,6 +129,8 @@ struct IncludeErrors(Vec<knuffel::Error>);
+ // We don't *need* it because we have a recursion limit, but it makes for nicer error messages.
+ struct IncludeStack(HashSet<PathBuf>);
+ struct SawMruBinds(Rc<Cell<bool>>);
++#[derive(Clone, Default)]
++struct OutputGroupMemberSet(Rc<RefCell<HashSet<String>>>);
+ 
+ // Rather than listing all fields and deriving knuffel::Decode, we implement
+ // knuffel::DecodeChildren by hand, since we need custom logic for every field anyway: we want to
+@@ -149,6 +154,7 @@ where
+         let include_errors = ctx.get::<Rc<RefCell<IncludeErrors>>>().unwrap().clone();
+         let recursion = ctx.get::<Recursion>().unwrap().0;
+         let saw_mru_binds = ctx.get::<SawMruBinds>().unwrap().0.clone();
++        let output_group_members = ctx.get::<OutputGroupMemberSet>().unwrap().clone();
+ 
+         let mut seen = HashSet::new();
+ 
+@@ -207,7 +213,9 @@ where
+                 // Multipart sections.
+                 "output" => {
+                     let part = Output::decode_node(node, ctx)?;
+-                    config.borrow_mut().outputs.0.push(part);
++                    if part.claim_group_members(&output_group_members, node, ctx) {
++                        config.borrow_mut().outputs.0.push(part);
++                    }
+                 }
+                 "spawn-at-startup" => m_push!(spawn_at_startup),
+                 "spawn-sh-at-startup" => m_push!(spawn_sh_at_startup),
+@@ -415,6 +423,7 @@ where
+                                 ctx.set(include_errors.clone());
+                                 ctx.set(IncludeStack(include_stack));
+                                 ctx.set(SawMruBinds(saw_mru_binds.clone()));
++                                ctx.set(output_group_members.clone());
+                                 ctx.set(config.clone());
+                             });
+ 
+@@ -515,6 +524,7 @@ impl Config {
+                 ctx.set(include_errors.clone());
+                 ctx.set(IncludeStack(include_stack));
+                 ctx.set(SawMruBinds(Rc::new(Cell::new(false))));
++                ctx.set(OutputGroupMemberSet::default());
+                 ctx.set(config.clone());
+             },
+         );
+@@ -648,6 +658,78 @@ mod tests {
+         assert_eq!(config.input.keyboard.repeat_rate, 25);
+     }
+ 
++    #[test]
++    fn tiled_group_claims_are_shared_across_includes() {
++        let dir = tempfile::tempdir().unwrap();
++        fs::write(
++            dir.path().join("first.kdl"),
++            r#"
++            output "first" {
++                tiled-group "DP-4" "DP-5"
++            }
++            "#,
++        )
++        .unwrap();
++        fs::write(
++            dir.path().join("second.kdl"),
++            r#"
++            output "second" {
++                tiled-group "DP-5" "DP-6"
++            }
++            "#,
++        )
++        .unwrap();
++
++        let result = Config::parse(
++            &dir.path().join("config.kdl"),
++            "include \"first.kdl\"\ninclude \"second.kdl\"",
++        );
++
++        let err = result.config.unwrap_err();
++        let debug = format!("{err:?}");
++        assert!(
++            debug.contains("already part of another tiled-group"),
++            "{debug}",
++        );
++    }
++
++    #[test]
++    fn display_group_claims_are_shared_across_includes() {
++        let dir = tempfile::tempdir().unwrap();
++        fs::write(
++            dir.path().join("first.kdl"),
++            r#"
++            output "wall" {
++                display-group {
++                    member "DVI-I-1"
++                    member "DVI-I-2"
++                }
++            }
++            "#,
++        )
++        .unwrap();
++        fs::write(
++            dir.path().join("second.kdl"),
++            r#"
++            output "other" {
++                tiled-group "DVI-I-2" "DVI-I-3"
++            }
++            "#,
++        )
++        .unwrap();
++
++        let result = Config::parse(
++            &dir.path().join("config.kdl"),
++            "include \"first.kdl\"\ninclude \"second.kdl\"",
++        );
++        let err = result.config.unwrap_err();
++        let debug = format!("{err:?}");
++        assert!(
++            debug.contains("already part of another tiled-group"),
++            "{debug}"
++        );
++    }
++
+     #[track_caller]
+     fn do_parse(text: &str) -> Config {
+         Config::parse_mem(text)
+@@ -1184,6 +1266,8 @@ mod tests {
+                                 on_demand: true,
+                             },
+                         ),
++                        tiled_group: None,
++                        display_group: None,
+                         focus_at_startup: true,
+                         background_color: Some(
+                             Color {
+@@ -1226,6 +1310,8 @@ mod tests {
+                         ),
+                         modeline: None,
+                         variable_refresh_rate: None,
++                        tiled_group: None,
++                        display_group: None,
+                         focus_at_startup: false,
+                         background_color: None,
+                         backdrop_color: None,
+@@ -1256,6 +1342,8 @@ mod tests {
+                             },
+                         ),
+                         variable_refresh_rate: None,
++                        tiled_group: None,
++                        display_group: None,
+                         focus_at_startup: false,
+                         background_color: None,
+                         backdrop_color: None,
+@@ -2271,6 +2359,7 @@ mod tests {
+                 honor_xdg_activation_with_invalid_serial: false,
+                 deactivate_unfocused_windows: false,
+                 skip_cursor_only_updates_during_vrr: false,
++                tiled_groups: false,
+             },
+             workspaces: [
+                 Workspace {
+diff --git a/niri-config/src/output.rs b/niri-config/src/output.rs
+index 48572f6e..aadbe2bb 100644
+--- a/niri-config/src/output.rs
++++ b/niri-config/src/output.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashSet;
+ use std::str::FromStr;
+ 
+ use knuffel::ast::SpannedNode;
+@@ -8,7 +9,7 @@ use knuffel::Decode;
+ use niri_ipc::{ConfiguredMode, HSyncPolarity, Transform, VSyncPolarity};
+ 
+ use crate::gestures::HotCorners;
+-use crate::{Color, FloatOrInt, LayoutPart};
++use crate::{Color, FloatOrInt, LayoutPart, OutputGroupMemberSet};
+ 
+ #[derive(Debug, Default, Clone, PartialEq)]
+ pub struct Outputs(pub Vec<Output>);
+@@ -68,6 +69,10 @@ pub struct Output {
+     #[knuffel(child)]
+     pub variable_refresh_rate: Option<Vrr>,
+     #[knuffel(child)]
++    pub tiled_group: Option<TiledGroup>,
++    #[knuffel(child)]
++    pub display_group: Option<DisplayGroup>,
++    #[knuffel(child)]
+     pub focus_at_startup: bool,
+     // Deprecated; use layout.background_color.
+     #[knuffel(child)]
+@@ -107,6 +112,8 @@ impl Default for Output {
+             mode: None,
+             modeline: None,
+             variable_refresh_rate: None,
++            tiled_group: None,
++            display_group: None,
+             background_color: None,
+             backdrop_color: None,
+             hot_corners: None,
+@@ -115,7 +122,7 @@ impl Default for Output {
+     }
+ }
+ 
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct OutputName {
+     pub connector: String,
+     pub make: Option<String>,
+@@ -140,6 +147,411 @@ pub struct Vrr {
+     pub on_demand: bool,
+ }
+ 
++/// Connectors to stitch into one logical tiled output, e.g. a dual-SST 5K panel connected
++/// over two DisplayPort links.
++///
++/// Written as a child of an `output` block: `tiled-group "DP-4" "DP-5"`. The output block's
++/// settings (scale, position, ...) apply to the resulting stitched output. The first connector
++/// listed is the leftmost tile.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TiledGroup(pub Vec<String>);
++
++/// Two to four ordinary outputs joined into one logical display.
++#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
++pub struct DisplayGroup {
++    #[knuffel(children(name = "member"))]
++    pub members: Vec<DisplayGroupMember>,
++    #[knuffel(child, unwrap(argument, str), default)]
++    pub render_policy: GroupRenderPolicy,
++    #[knuffel(child, unwrap(argument, str), default)]
++    pub refresh_sync: GroupRefreshSync,
++    /// Stable selector of the member whose DRM sequence paces same-device groups.
++    #[knuffel(child, unwrap(argument))]
++    pub primary: Option<String>,
++}
++
++#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
++pub struct DisplayGroupMember {
++    /// Connector name or the existing `make model serial` output selector.
++    #[knuffel(argument)]
++    pub output: String,
++    #[knuffel(child)]
++    pub mode: Option<Mode>,
++    #[knuffel(child, unwrap(argument, str), default = Transform::Normal)]
++    pub transform: Transform,
++    /// Position in post-transform physical pixels. Either every member supplies it or none do.
++    #[knuffel(child)]
++    pub position: Option<Position>,
++}
++
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub enum GroupRenderPolicy {
++    #[default]
++    Auto,
++    Composited,
++}
++
++impl FromStr for GroupRenderPolicy {
++    type Err = miette::Error;
++
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        match value {
++            "auto" => Ok(Self::Auto),
++            "composited" => Ok(Self::Composited),
++            _ => Err(miette::miette!(
++                r#"invalid display-group render policy; expected "auto" or "composited""#
++            )),
++        }
++    }
++}
++
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub enum GroupRefreshSync {
++    #[default]
++    Strict,
++    Relaxed,
++}
++
++impl FromStr for GroupRefreshSync {
++    type Err = miette::Error;
++
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        match value {
++            "strict" => Ok(Self::Strict),
++            "relaxed" => Ok(Self::Relaxed),
++            _ => Err(miette::miette!(
++                r#"invalid display-group refresh synchronization; expected "strict" or "relaxed""#
++            )),
++        }
++    }
++}
++
++/// Stable identity of the output declaration selected for a live output.
++///
++/// Output names are not required to be unique. For tiled outputs, the member declaration
++/// disambiguates otherwise-identically-named blocks across config reloads.
++#[derive(Debug, Clone, PartialEq)]
++pub struct OutputConfigBinding {
++    name: String,
++    tiled_group: Option<TiledGroup>,
++    display_group: Option<DisplayGroup>,
++}
++
++impl OutputConfigBinding {
++    pub fn name(&self) -> &str {
++        &self.name
++    }
++
++    pub fn equivalent(&self, other: &Self) -> bool {
++        self.name.eq_ignore_ascii_case(&other.name)
++            && tiled_groups_match(self.tiled_group.as_ref(), other.tiled_group.as_ref())
++            && display_groups_match(self.display_group.as_ref(), other.display_group.as_ref())
++    }
++
++    fn matches(&self, output: &Output) -> bool {
++        self.name.eq_ignore_ascii_case(&output.name)
++            && tiled_groups_match(self.tiled_group.as_ref(), output.tiled_group.as_ref())
++            && display_groups_match(self.display_group.as_ref(), output.display_group.as_ref())
++    }
++}
++
++impl From<&Output> for OutputConfigBinding {
++    fn from(output: &Output) -> Self {
++        Self {
++            name: output.name.clone(),
++            tiled_group: output.tiled_group.clone(),
++            display_group: output.display_group.clone(),
++        }
++    }
++}
++
++fn display_groups_match(a: Option<&DisplayGroup>, b: Option<&DisplayGroup>) -> bool {
++    match (a, b) {
++        (None, None) => true,
++        (Some(a), Some(b)) => {
++            a.render_policy == b.render_policy
++                && a.refresh_sync == b.refresh_sync
++                && match (&a.primary, &b.primary) {
++                    (None, None) => true,
++                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
++                    _ => false,
++                }
++                && a.members.len() == b.members.len()
++                && a.members.iter().zip(&b.members).all(|(a, b)| {
++                    a.output.eq_ignore_ascii_case(&b.output)
++                        && a.mode == b.mode
++                        && a.transform == b.transform
++                        && a.position == b.position
++                })
++        }
++        _ => false,
++    }
++}
++
++fn tiled_groups_match(a: Option<&TiledGroup>, b: Option<&TiledGroup>) -> bool {
++    match (a, b) {
++        (None, None) => true,
++        (Some(a), Some(b)) => {
++            a.0.len() == b.0.len() && a.0.iter().zip(&b.0).all(|(a, b)| a.eq_ignore_ascii_case(b))
++        }
++        _ => false,
++    }
++}
++
++impl<S: ErrorSpan> Decode<S> for TiledGroup {
++    fn decode_node(node: &SpannedNode<S>, ctx: &mut Context<S>) -> Result<Self, DecodeError<S>> {
++        let mut valid = true;
++        if let Some(type_name) = &node.type_name {
++            valid = false;
++            ctx.emit_error(DecodeError::unexpected(
++                type_name,
++                "type name",
++                "no type name expected for this node",
++            ));
++        }
++
++        for child in node.children() {
++            valid = false;
++            ctx.emit_error(DecodeError::unexpected(
++                child,
++                "node",
++                format!("unexpected node `{}`", child.node_name.escape_default()),
++            ));
++        }
++
++        for span in node.properties.keys() {
++            valid = false;
++            ctx.emit_error(DecodeError::unexpected(
++                span,
++                "property",
++                format!("unexpected property `{}`", span.escape_default()),
++            ));
++        }
++
++        let mut group_members = HashSet::new();
++        let mut members = Vec::new();
++        for (idx, arg) in node.arguments.iter().enumerate() {
++            let member: String = knuffel::traits::DecodeScalar::decode(arg, ctx)?;
++
++            if members.len() == 2 {
++                valid = false;
++                ctx.emit_error(DecodeError::unexpected(
++                    &arg.literal,
++                    "argument",
++                    "tiled-group accepts exactly two connectors",
++                ));
++                continue;
++            }
++
++            let normalized = member.to_ascii_lowercase();
++            if !group_members.insert(normalized.clone()) {
++                valid = false;
++                ctx.emit_error(DecodeError::unexpected(
++                    &arg.literal,
++                    "argument",
++                    format!("duplicate connector `{member}` in tiled-group"),
++                ));
++                continue;
++            }
++
++            members.push((member, normalized, idx));
++        }
++
++        if members.len() != 2 {
++            valid = false;
++            ctx.emit_error(DecodeError::missing(
++                node,
++                "tiled-group requires exactly two connectors",
++            ));
++        }
++
++        if !valid {
++            members.clear();
++        }
++
++        Ok(TiledGroup(
++            members.into_iter().map(|(member, _, _)| member).collect(),
++        ))
++    }
++}
++
++impl Output {
++    pub(crate) fn claim_group_members<S: ErrorSpan>(
++        &self,
++        claimed: &OutputGroupMemberSet,
++        node: &SpannedNode<S>,
++        ctx: &mut Context<S>,
++    ) -> bool {
++        if self.tiled_group.is_some() && self.display_group.is_some() {
++            ctx.emit_error(DecodeError::unexpected(
++                node,
++                "node",
++                "an output cannot contain both tiled-group and display-group",
++            ));
++            return false;
++        }
++
++        let (kind, members): (&str, Vec<(&str, S)>) = if let Some(group) = &self.tiled_group {
++            if group.0.len() != 2 {
++                return false;
++            }
++            let group_node = node
++                .children()
++                .find(|child| &**child.node_name == "tiled-group")
++                .unwrap_or(node);
++            (
++                "tiled-group",
++                group
++                    .0
++                    .iter()
++                    .zip(&group_node.arguments)
++                    .map(|(member, argument)| (member.as_str(), argument.literal.span().clone()))
++                    .collect(),
++            )
++        } else if let Some(group) = &self.display_group {
++            let group_node = node
++                .children()
++                .find(|child| &**child.node_name == "display-group")
++                .unwrap_or(node);
++            if self.transform != Transform::Normal
++                || self.mode.is_some()
++                || self.modeline.is_some()
++                || self.max_bpc.is_some()
++                || self.variable_refresh_rate.is_some()
++            {
++                ctx.emit_error(DecodeError::unexpected(
++                    group_node,
++                    "property",
++                    "display-group mode and transform belong on member blocks; modeline, max-bpc, and variable-refresh-rate are not supported",
++                ));
++                return false;
++            }
++            if !(2..=4).contains(&group.members.len()) {
++                ctx.emit_error(DecodeError::missing(
++                    group_node,
++                    "display-group requires between two and four members",
++                ));
++                return false;
++            }
++            let positioned = group
++                .members
++                .iter()
++                .filter(|member| member.position.is_some())
++                .count();
++            if positioned != 0 && positioned != group.members.len() {
++                ctx.emit_error(DecodeError::missing(
++                    group_node,
++                    "display-group positions must be supplied for every member or omitted for every member",
++                ));
++                return false;
++            }
++            let member_nodes = group_node
++                .children()
++                .filter(|child| &**child.node_name == "member")
++                .collect::<Vec<_>>();
++            for (member, member_node) in group.members.iter().zip(member_nodes) {
++                if member.mode.as_ref().is_some_and(|mode| mode.custom) {
++                    let mode_node = member_node
++                        .children()
++                        .find(|child| &**child.node_name == "mode")
++                        .unwrap_or(member_node);
++                    ctx.emit_error(DecodeError::unexpected(
++                        mode_node,
++                        "node",
++                        "custom display-group member modes are not supported; use an advertised mode",
++                    ));
++                    return false;
++                }
++                if member
++                    .position
++                    .is_some_and(|position| position.x < 0 || position.y < 0)
++                {
++                    let position_node = member_node
++                        .children()
++                        .find(|child| &**child.node_name == "position")
++                        .unwrap_or(member_node);
++                    ctx.emit_error(DecodeError::missing(
++                        position_node,
++                        "display-group member positions cannot be negative",
++                    ));
++                    return false;
++                }
++            }
++            if let Some(primary) = &group.primary {
++                let matches = group
++                    .members
++                    .iter()
++                    .filter(|member| member.output.eq_ignore_ascii_case(primary))
++                    .count();
++                if matches != 1 {
++                    ctx.emit_error(DecodeError::missing(
++                        group_node,
++                        "display-group primary must identify exactly one member",
++                    ));
++                    return false;
++                }
++            }
++            (
++                "display-group",
++                group
++                    .members
++                    .iter()
++                    .zip(
++                        group_node
++                            .children()
++                            .filter(|child| &**child.node_name == "member"),
++                    )
++                    .map(|(member, member_node)| {
++                        (member.output.as_str(), member_node.node_name.span().clone())
++                    })
++                    .collect(),
++            )
++        } else {
++            return true;
++        };
++
++        let mut local = HashSet::new();
++        let mut valid = true;
++        for (member, span) in &members {
++            if !local.insert(member.to_ascii_lowercase()) {
++                valid = false;
++                ctx.emit_error(DecodeError::Unexpected {
++                    span: span.clone(),
++                    kind: "member",
++                    message: format!("duplicate output `{member}` in {kind}"),
++                });
++            }
++        }
++        let conflicts = {
++            let claimed = claimed.0.borrow();
++            members
++                .iter()
++                .filter(|(member, _)| claimed.contains(&member.to_ascii_lowercase()))
++                .cloned()
++                .collect::<Vec<_>>()
++        };
++        if !conflicts.is_empty() {
++            valid = false;
++            for (member, span) in conflicts {
++                let message = if kind == "tiled-group" {
++                    format!("connector `{member}` is already part of another tiled-group")
++                } else {
++                    format!("output `{member}` is already part of another output group")
++                };
++                ctx.emit_error(DecodeError::Unexpected {
++                    span,
++                    kind: "member",
++                    message,
++                });
++            }
++        }
++        if valid {
++            claimed.0.borrow_mut().extend(local);
++        }
++        valid
++    }
++}
++
+ impl FromIterator<Output> for Outputs {
+     fn from_iter<T: IntoIterator<Item = Output>>(iter: T) -> Self {
+         Self(Vec::from_iter(iter))
+@@ -154,6 +566,31 @@ impl Outputs {
+     pub fn find_mut(&mut self, name: &OutputName) -> Option<&mut Output> {
+         self.0.iter_mut().find(|o| name.matches(&o.name))
+     }
++
++    /// Finds the exact config declaration bound to an output, falling back to ordinary output
++    /// name matching if that declaration no longer exists.
++    pub fn find_bound(
++        &self,
++        name: &OutputName,
++        binding: Option<&OutputConfigBinding>,
++    ) -> Option<&Output> {
++        binding
++            .and_then(|binding| self.0.iter().find(|output| binding.matches(output)))
++            .or_else(|| self.find(name))
++    }
++
++    pub fn find_bound_mut(
++        &mut self,
++        name: &OutputName,
++        binding: Option<&OutputConfigBinding>,
++    ) -> Option<&mut Output> {
++        let bound_idx =
++            binding.and_then(|binding| self.0.iter().position(|output| binding.matches(output)));
++        match bound_idx {
++            Some(idx) => self.0.get_mut(idx),
++            None => self.find_mut(name),
++        }
++    }
+ }
+ 
+ impl OutputName {
+@@ -685,4 +1122,394 @@ mod tests {
+         "#
+         );
+     }
++
++    #[test]
++    fn parse_tiled_group() {
++        let config = crate::Config::parse_mem(
++            r##"
++            output "DP-4+DP-5" {
++                tiled-group "DP-4" "DP-5"
++                scale 2
++            }
++            "##,
++        )
++        .map_err(miette::Report::new)
++        .unwrap();
++
++        let output = &config.outputs.0[0];
++        assert_eq!(
++            output.tiled_group.as_ref().unwrap().0,
++            vec!["DP-4".to_string(), "DP-5".to_string()],
++        );
++    }
++
++    #[test]
++    fn parse_display_group() {
++        let config = crate::Config::parse_mem(
++            r##"
++            output "portrait-wall" {
++                display-group {
++                    member "LG Electronics LG ULTRAFINE 0x01010101" {
++                        mode "3840x2160@59.997"
++                        transform "90"
++                    }
++                    member "DVI-I-1" {
++                        mode "3840x2160@59.997"
++                        transform "270"
++                    }
++                    primary "DVI-I-1"
++                    render-policy "composited"
++                    refresh-sync "strict"
++                }
++                scale 1.25
++            }
++            "##,
++        )
++        .map_err(miette::Report::new)
++        .unwrap();
++
++        let output = &config.outputs.0[0];
++        let group = output.display_group.as_ref().unwrap();
++        assert_eq!(group.members.len(), 2);
++        assert_eq!(group.members[0].transform, Transform::_90);
++        assert_eq!(group.members[1].transform, Transform::_270);
++        assert_eq!(group.primary.as_deref(), Some("DVI-I-1"));
++        assert_eq!(group.render_policy, GroupRenderPolicy::Composited);
++        assert_eq!(group.refresh_sync, GroupRefreshSync::Strict);
++    }
++
++    #[test]
++    fn display_group_rejects_silently_ignored_outer_kms_properties() {
++        for property in [
++            r#"transform "90""#,
++            r#"mode "1920x1080@60""#,
++            r#"max-bpc 10"#,
++            r#"variable-refresh-rate"#,
++        ] {
++            let config = format!(
++                r#"
++                output "wall" {{
++                    display-group {{ member "DP-1"; member "DP-2"; }}
++                    {property}
++                }}
++                "#,
++            );
++            let err = crate::Config::parse_mem(&config).unwrap_err();
++            let debug = format!("{err:?}");
++            assert!(debug.contains("not supported"), "{debug}");
++        }
++    }
++
++    #[test]
++    fn display_group_members_are_claimed_transactionally() {
++        for invalid in [
++            r#"output "A" { display-group { member "DP-1"; } }"#,
++            r#"output "A" { display-group { member "DP-1"; member "DP-2"; member "dp-2"; } }"#,
++            r#"output "A" { display-group { member "DP-1" { position x=0 y=0; }; member "DP-2"; } }"#,
++        ] {
++            let config = format!(
++                r#"
++                {invalid}
++                output "B" {{ display-group {{ member "DP-1"; member "DP-4"; }} }}
++                "#
++            );
++            let err = crate::Config::parse_mem(&config).unwrap_err();
++            let debug = format!("{err:?}");
++            assert!(
++                !debug.contains("already part of another output group"),
++                "{debug}",
++            );
++        }
++    }
++
++    #[test]
++    fn display_group_rejects_invalid_member_counts() {
++        for members in [
++            "",
++            r#"member "DP-1"; member "DP-2"; member "DP-3"; member "DP-4"; member "DP-5";"#,
++        ] {
++            let config = format!(
++                r#"
++                output "wall" {{
++                    display-group {{
++                        {members}
++                    }}
++                }}
++                "#,
++            );
++            let err = crate::Config::parse_mem(&config).unwrap_err();
++            assert!(
++                format!("{err:?}").contains("requires between two and four members"),
++                "{err:?}",
++            );
++        }
++    }
++
++    #[test]
++    fn display_group_rejects_duplicate_member() {
++        let err = crate::Config::parse_mem(
++            r#"
++            output "wall" {
++                display-group {
++                    member "DP-1"
++                    member "dp-1"
++                }
++            }
++            "#,
++        )
++        .unwrap_err();
++        assert!(
++            format!("{err:?}").contains("duplicate output `dp-1`"),
++            "{err:?}",
++        );
++    }
++
++    #[test]
++    fn display_group_rejects_invalid_policies() {
++        for setting in [
++            r#"render-policy "sometimes""#,
++            r#"refresh-sync "eventually""#,
++        ] {
++            let config = format!(
++                r#"output "wall" {{ display-group {{ member "DP-1"; member "DP-2"; {setting}; }} }}"#,
++            );
++            assert!(crate::Config::parse_mem(&config).is_err(), "{setting}");
++        }
++    }
++
++    #[test]
++    fn display_group_primary_must_match_exactly_one_member() {
++        for primary in ["DP-3", "dp-1"] {
++            let config = format!(
++                r#"
++                output "wall" {{
++                    display-group {{
++                        member "DP-1"
++                        member "dp-1"
++                        primary "{primary}"
++                    }}
++                }}
++                "#,
++            );
++            let err = crate::Config::parse_mem(&config).unwrap_err();
++            assert!(
++                format!("{err:?}").contains("primary must identify exactly one member"),
++                "{err:?}",
++            );
++        }
++    }
++
++    #[test]
++    fn output_rejects_both_group_syntaxes() {
++        let err = crate::Config::parse_mem(
++            r#"
++            output "wall" {
++                tiled-group "DP-1" "DP-2"
++                display-group { member "DP-3"; member "DP-4"; }
++            }
++            "#,
++        )
++        .unwrap_err();
++        assert!(format!("{err:?}").contains("cannot contain both"));
++    }
++
++    #[test]
++    fn display_group_rejects_negative_positions_during_parse() {
++        let err = crate::Config::parse_mem(
++            r#"
++            output "wall" {
++                display-group {
++                    member "DP-1" { position x=-1 y=0; }
++                    member "DP-2" { position x=1919 y=0; }
++                }
++            }
++            "#,
++        )
++        .unwrap_err();
++        assert!(format!("{err:?}").contains("positions cannot be negative"));
++    }
++
++    #[test]
++    fn display_group_rejects_custom_member_modes_during_parse() {
++        let err = crate::Config::parse_mem(
++            r#"
++            output "wall" {
++                display-group {
++                    member "DP-1" { mode custom=true "1920x1080@60"; }
++                    member "DP-2"
++                }
++            }
++            "#,
++        )
++        .unwrap_err();
++        let debug = format!("{err:?}");
++        assert!(
++            debug.contains("custom display-group member modes are not supported"),
++            "{debug}"
++        );
++    }
++
++    #[test]
++    fn tiled_and_display_groups_share_claims() {
++        let err = crate::Config::parse_mem(
++            r#"
++            output "A" { tiled-group "DP-1" "DP-2"; }
++            output "B" {
++                display-group {
++                    member "DP-2"
++                    member "DP-3"
++                }
++            }
++            "#,
++        )
++        .unwrap_err();
++        let debug = format!("{err:?}");
++        assert!(
++            debug.contains("output `DP-2` is already part of another output group"),
++            "{debug}",
++        );
++    }
++
++    #[test]
++    fn display_group_binding_disambiguates_duplicate_output_names() {
++        let config = crate::Config::parse_mem(
++            r#"
++            output "wall" { scale 1.5; }
++            output "wall" {
++                display-group { member "DP-1"; member "DP-2"; }
++                scale 2
++            }
++            "#,
++        )
++        .unwrap();
++        let name = OutputName {
++            connector: "DP-1+DP-2".into(),
++            make: None,
++            model: None,
++            serial: None,
++        };
++        let binding = OutputConfigBinding::from(&config.outputs.0[1]);
++        assert_eq!(
++            config
++                .outputs
++                .find_bound(&name, Some(&binding))
++                .unwrap()
++                .scale
++                .unwrap()
++                .0,
++            2.0,
++        );
++    }
++
++    #[test]
++    fn error_tiled_group_too_few_connectors() {
++        assert!(crate::Config::parse_mem(r#"output "A" { tiled-group "DP-4"; }"#).is_err());
++        assert!(crate::Config::parse_mem(r#"output "A" { tiled-group; }"#).is_err());
++    }
++
++    #[test]
++    fn error_tiled_group_too_many_connectors() {
++        assert!(
++            crate::Config::parse_mem(r#"output "A" { tiled-group "DP-4" "DP-5" "DP-6"; }"#)
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn invalid_tiled_group_does_not_claim_connectors() {
++        for invalid in [
++            r#"output "A" { tiled-group "DP-4"; }"#,
++            r#"output "A" { tiled-group "DP-4" "DP-5" "DP-6"; }"#,
++            r#"output "A" { tiled-group "DP-4" "DP-5" { unexpected-child; } }"#,
++        ] {
++            let config = format!(
++                r#"
++                {invalid}
++                output "B" {{ tiled-group "DP-4" "DP-7"; }}
++                "#
++            );
++            let err = crate::Config::parse_mem(&config).unwrap_err();
++            let debug = format!("{err:?}");
++            assert!(
++                !debug.contains("already part of another tiled-group"),
++                "{debug}",
++            );
++        }
++    }
++
++    #[test]
++    fn conflicting_invalid_tiled_group_does_not_partially_claim() {
++        let err = crate::Config::parse_mem(
++            r#"
++            output "A" { tiled-group "DP-1" "DP-2"; }
++            output "B" { tiled-group "DP-2" "DP-3"; }
++            output "C" { tiled-group "DP-3" "DP-4"; }
++            "#,
++        )
++        .unwrap_err();
++        let debug = format!("{err:?}");
++        assert_eq!(
++            debug.matches("already part of another tiled-group").count(),
++            1,
++            "{debug}",
++        );
++        assert!(debug.contains("connector `DP-2`"), "{debug}");
++    }
++
++    #[test]
++    fn error_tiled_group_duplicate_connector() {
++        assert!(crate::Config::parse_mem(r#"output "A" { tiled-group "DP-4" "dp-4"; }"#).is_err());
++    }
++
++    #[test]
++    fn error_tiled_group_connector_in_two_groups() {
++        assert!(crate::Config::parse_mem(
++            r#"
++            output "A" { tiled-group "DP-4" "DP-5"; }
++            output "B" { tiled-group "DP-5" "DP-6"; }
++            "#
++        )
++        .is_err());
++    }
++
++    #[test]
++    fn bound_output_config_takes_precedence() {
++        let config = crate::Config::parse_mem(
++            r#"
++            output "my-5k" {
++                scale 1.5
++            }
++            output "my-5k" {
++                tiled-group "DP-4" "DP-5"
++                scale 2
++            }
++            "#,
++        )
++        .unwrap();
++        let name = OutputName {
++            connector: "DP-4+DP-5".into(),
++            make: None,
++            model: None,
++            serial: None,
++        };
++        let binding = OutputConfigBinding::from(&config.outputs.0[1]);
++
++        let output = config.outputs.find_bound(&name, Some(&binding)).unwrap();
++        assert_eq!(output.name, "my-5k");
++        assert_eq!(output.scale.unwrap().0, 2.);
++    }
++
++    #[test]
++    fn parse_debug_tiled_groups_flag() {
++        let config = crate::Config::parse_mem(
++            r#"
++            debug {
++                tiled-groups
++            }
++            "#,
++        )
++        .map_err(miette::Report::new)
++        .unwrap();
++        assert!(config.debug.tiled_groups);
++    }
+ }

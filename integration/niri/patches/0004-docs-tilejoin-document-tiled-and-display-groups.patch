@@ -1,0 +1,133 @@
+From f0120d72025bdbc1da2ee284af79ef6941c661c3 Mon Sep 17 00:00:00 2001
+From: niri-tilejoin <niri-tilejoin@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 12:46:08 -0700
+Subject: [PATCH 4/4] docs(tilejoin): document tiled and display groups
+
+---
+ docs/wiki/Configuration:-Debug-Options.md | 16 +++++
+ docs/wiki/Configuration:-Outputs.md       | 85 +++++++++++++++++++++++
+ 2 files changed, 101 insertions(+)
+
+diff --git a/docs/wiki/Configuration:-Debug-Options.md b/docs/wiki/Configuration:-Debug-Options.md
+index 7f460e06..8f1a5e4e 100644
+--- a/docs/wiki/Configuration:-Debug-Options.md
++++ b/docs/wiki/Configuration:-Debug-Options.md
+@@ -324,6 +324,22 @@ debug {
+ }
+ ```
+ 
++### `tiled-groups`
++
++<sup>Since: next release</sup> (experimental)
++
++Automatically stitches tiled monitors (panels connected over two independent links on the same GPU, e.g. the LG UltraFine 5K over two DisplayPort SST links) into single logical outputs, using the kernel-reported `TILE` connector topology.
++
++A pair is only stitched when both tiles advertise a horizontal 2x1 single-monitor topology with the same EDID identity, expose the same primary-plane pixel formats, and share a mode with byte-identical timings; otherwise the connectors stay separate outputs and the reason is logged with a `tiled-groups:` prefix.
++
++Explicit [`tiled-group`](./Configuration:-Outputs.md#tiled-group) output config does not require this flag and is authoritative over auto-detection.
++
++```kdl
++debug {
++    tiled-groups
++}
++```
++
+ ### Key Bindings
+ 
+ These are not debug options, but rather key bindings.
+diff --git a/docs/wiki/Configuration:-Outputs.md b/docs/wiki/Configuration:-Outputs.md
+index 29241c04..7f9d27d7 100644
+--- a/docs/wiki/Configuration:-Outputs.md
++++ b/docs/wiki/Configuration:-Outputs.md
+@@ -226,6 +226,91 @@ output "HDMI-A-1" {
+ }
+ ```
+ 
++### `tiled-group`
++
++<sup>Since: next release</sup> (experimental)
++
++Stitches two physical display connectors into one logical output.
++This is meant for tiled monitors that connect over two independent links and present each half as a separate display, like the LG UltraFine 5K (two DisplayPort SST links, each running 2560x2880@60).
++
++niri renders one framebuffer at the full combined resolution (e.g. 5120x2880) and programs both tiles in a single atomic commit, cropping the framebuffer per tile. This keeps both halves on the same submitted frame; hardware-level phase drift between the two display streams remains outside niri's control.
++The stitched output behaves like a single normal output: one `wl_output`, one mode (the synthesized full-resolution mode), workspaces span it as usual.
++
++```kdl
++output "DP-4+DP-5" {
++    tiled-group "DP-4" "DP-5"
++    scale 2
++}
++```
++
++The output block's settings apply to the stitched group.
++The group is named by joining the sorted member connector names with `+` (e.g. `DP-4+DP-5`), and can also be matched by make/model/serial like any other output.
++The first connector listed is the left tile, unless the hardware advertises tile positions (in which case those are authoritative).
++
++Requirements and limitations:
++
++- Both connectors must be on the same GPU and must share a mode with byte-identical timings; otherwise niri logs an error and connects them as two separate outputs.
++- Only two horizontal tiles are supported.
++- Tiled outputs do not support VRR or custom modelines. Strict direct scanout is available for a single opaque fullscreen surface at the native logical size, with no transform or scaling, when its dmabuf format and modifier work on both primary planes. Niri validates the two-head flip with a TEST_ONLY commit and automatically falls back to compositing when any requirement is not met.
++- `amdgpu_dm_force_timing_sync` is not a substitute for tiled-output support: it is card-global and can stall page flips on mixed-refresh configurations.
++
++Alternatively, set the `tiled-groups` [debug flag](./Configuration:-Debug-Options.md#tiled-groups) to stitch matching tile pairs automatically without listing the connectors.
++Explicit `tiled-group` config is authoritative over auto-detection.
++
++### `display-group`
++
++<sup>Since: next release</sup> (experimental)
++
++Joins two to four ordinary outputs into one logical output, including outputs on different DRM devices.
++Unlike `tiled-group`, every member keeps its own KMS framebuffer and page flip; niri crops the logical scene into each member and waits for every member submitted for that logical frame before advancing the group frame clock.
++
++For example, two 3840x2160 DisplayLink monitors rotated into portrait and placed side by side become one 4320x3840 physical output (3456x3072 logical at scale 1.25):
++
++```kdl
++output "portrait-wall" {
++    display-group {
++        member "DVI-I-1" {
++            mode "3840x2160@59.997"
++            transform "270"
++            position x=0 y=0
++        }
++        member "DVI-I-2" {
++            mode "3840x2160@59.997"
++            transform "90"
++            position x=2160 y=0
++        }
++        primary "DVI-I-1"
++        refresh-sync "strict"
++        render-policy "auto"
++    }
++    scale 1.25
++}
++```
++
++Member selectors use the same connector or `make model serial` matching as normal output blocks.
++For docks where connector numbering can change, prefer `make model serial` when it uniquely identifies each monitor.
++If no member positions are given, niri lays out members in declaration order as one horizontal row after applying each member transform.
++If any position is present, every member needs one.
++Positions are non-negative post-transform physical pixels; their rectangles must start at `(0, 0)` and cover one bounding rectangle without gaps or overlap.
++
++`refresh-sync "strict"` searches every advertised mode for a common refresh within 5 mHz, rather than comparing independently selected preferred modes.
++`refresh-sync "relaxed"` permits a 100 mHz difference.
++The logical output is paced at the slowest selected member refresh, and that same interval is reported in presentation feedback.
++This does not phase-lock independent monitors.
++
++`render-policy "auto"` permits primary-plane direct scanout only when every participating member can use it; otherwise niri re-renders the logical frame entirely composited before submitting any member.
++`render-policy "composited"` uses the same rendering path with direct scanout disabled.
++Member rectangles partition the transformed physical-pixel output exactly. Niri intersects the already physical, integer render-element geometry with those rectangles before relocating it to member-local coordinates, so fractional logical scaling cannot introduce a gap or overlap at the member boundary.
++
++Requirements and limitations:
++
++- A group has one logical frame in flight. A slow member stalls the next group frame; this avoids independent member queues drifting apart. DisplayLink USB scheduling jitter of 10-20 ms is expected and is well below the liveness watchdog.
++- General display-group members use independent Smithay DRM compositors, including when multiple members are on one DRM device. Niri prepares and validates every member before queuing any of them, but the page flips are not one atomic KMS transaction. If only some members submit, those physical heads may latch before recovery; niri discards the logical presentation feedback, does not advance the logical frame clock or sequence, retains every submitted buffer until its own completion event, and schedules a full composited repair. Use `tiled-group` for hardware tiles that require one shared framebuffer and one same-device atomic request.
++- Members without damage are not flipped to an undrawn alternate swapchain slot, since that slot may contain an older frame.
++- `mode` and `transform` belong in member blocks. Group-level custom modelines, VRR, and `max-bpc` are currently rejected instead of being silently ignored.
++- The group `primary` supplies stable output identity and is fixed for its lifetime. Generalized groups use a logical presentation sequence rather than any member's unrelated DRM sequence. If the primary disconnects, the group is torn down; niri does not re-elect a different primary mid-frame.
++- Screenshots and screencasts use the ordinary logical-output rendering path; no separate capture configuration is needed.
++
+ ### `focus-at-startup`
+ 
+ <sup>Since: 25.05</sup>

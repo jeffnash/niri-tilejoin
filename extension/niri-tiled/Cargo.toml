@@ -1,0 +1,22 @@
+[package]
+name = "niri-tiled"
+version.workspace = true
+description = "Build-time tiled and multi-monitor output extension for niri"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck = { version = "1.25.0", features = ["derive"] }
+drm-ffi = "0.9.1"
+niri-config = { version = "26.4.0", path = "../niri-config" }
+niri-ipc = { version = "26.4.0", path = "../niri-ipc" }
+smithay = { workspace = true, features = ["backend_drm", "backend_gbm", "desktop", "renderer_gl", "wayland_frontend"] }
+tracing.workspace = true
+tracy-client.workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
